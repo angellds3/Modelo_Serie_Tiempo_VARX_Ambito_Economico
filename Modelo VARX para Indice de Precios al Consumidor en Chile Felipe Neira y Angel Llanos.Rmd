@@ -1,0 +1,681 @@
+---
+title: "Modelo VARX para Indice de Precios al Consumidor en Chile"
+author: "Felipe Neira Rojas y Angel Llanos Herrera"
+date: "`r Sys.Date()`"
+output: 
+  prettydoc::html_pretty:
+    theme: cayman
+    toc: yes 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = FALSE, message=" ", warning = FALSE)
+```
+
+
+# Cargar base de datos
+
+El Índice de Precios al Consumidor (IPC) se puede medir en variación mensual. Donde, estas variaciones en ciertos periodos presentan una mayor volatilidad dependiendo del contexto nacional e internacional.
+        
+Con el fin de predecir la evolución del IPC se consideran ciertas variables estudiadas que pueden influir, en donde existen variables que tienen relación entre sí: IPC, Tasa de desempleo, Tasa de interés (TPM) y algunas que no, como lo son el Precio del petróleo Brent, Cambio del dólar a peso chileno y Precio Internacional de Alimentos (FAO). Por esto, se considera un modelo VARX, debido a la presencia variables endógenas y exógenas.
+
+
+```{r, results="hide"}
+library(lubridate)
+library(readr)
+library(zoo)
+library(vars)
+library(MTS)
+library(tseries)
+library(formattable)
+library(Metrics)
+library(ggplot2)
+library(plotly)
+library(nortest)
+library(FinTS)
+library(tibble)
+```
+
+
+```{r, results="hide", warning=FALSE}
+Contexto_IPC_2010_2024 <- read_csv("C:/Users/angel/Desktop/Contexto_IPC_2010_2024.csv")
+```
+
+
+```{r}
+library(tibble)
+resumen_contexto <- tibble(
+Variable = names(Contexto_IPC_2010_2024),
+Clase = sapply(Contexto_IPC_2010_2024, class),
+NAs = sapply(Contexto_IPC_2010_2024, function(x) sum(is.na(x))),
+Duplicados = ifelse(names(Contexto_IPC_2010_2024) == "FECHA",
+sum(duplicated(Contexto_IPC_2010_2024$FECHA)), "No aplica")
+)
+
+print(resumen_contexto)
+```
+
+Podemos notar que no existen variables con valores faltantes en ningún caso. También, cada una de las variables está bien definida (la FECHA como fecha y las demás como numéricas) debido a que previamente se hizo una limpieza y correcta definición, por lo que se está trabajando con una base de datos limpia. Además, no se logran apreciar fechas duplicadas, por lo que para cada observación mensual desde 2010 a 2024 existe solo una observación por mes.
+
+Variables (Mensuales desde 2010 a 2024)
+
+- REAL_VARIACION_IPC_PORCENTAJE: Variación porcentual del Índice de Precios al Consumidor en Chile.
+
+- TASA_DESEMPLEO_PORCENTAJE: Tasa de desempleo en Chile en porcentaje.
+
+- TASA_INTERES_PORCENTAJE: Tasa de política monetaria en Chile en porcentaje.
+
+- POILBREUSDM: Precio internacional en dólares del petróleo Brent.
+
+- USD_CLP: Tipo de cambio del Dólar con respecto al Peso Chileno. 
+
+- Food_Price_Index: Medida en los precios internacionales de una canasta de productos alimenticios en dólares.
+
+
+
+
+## Convertir a un objeto compatible con series de tiempo VAR y VARX.
+
+```{r}
+
+
+# Convertimos a zoo con índice de fecha
+datos_zoo <- zoo(Contexto_IPC_2010_2024[, -1], order.by = Contexto_IPC_2010_2024$FECHA)
+
+# Opcional: transformar a ts si todas las series comienzan en la misma fecha
+datos_ts <- ts(Contexto_IPC_2010_2024[, -1],
+               start = c(year(min(Contexto_IPC_2010_2024$FECHA)), month(min(Contexto_IPC_2010_2024$FECHA))),
+               frequency = 12)
+
+
+
+datos_VAR <- Contexto_IPC_2010_2024[, -1]  # Quitar fecha
+
+datos_MTS <- as.matrix(datos_VAR)
+
+
+```
+
+
+# Supuesto
+
+## Estacionariedad 
+
+Comprobaremos estacionariedad, supuesto necesario para la creación de un modelo VARX. Para esto, aplicaremos una Prueba de Dickey-Fuller aumentada (ADF test). 
+
+$H_0:$ La serie tiene una raíz unitaria  (no estacionaria)
+
+v/s 
+
+$H_1:$ La serie no tiene una raíz unitaria  (estacionaria)
+
+
+
+
+```{r}
+# Función para aplicar solo la prueba ADF
+verificar_estacionariedad_adf <- function(serie) {
+  adf_result <- tseries::adf.test(serie)
+  return(adf_result$p.value)
+}
+
+# Aplicar ADF a cada columna de datos_VAR
+resultados_adf <- apply(datos_VAR, 2, verificar_estacionariedad_adf)
+
+# Convertir a data frame con formato para tabla
+tabla_estacionariedad <- data.frame(
+  Variable = names(resultados_adf),
+  ADF_p = round(resultados_adf, 4),
+  row.names = NULL
+)
+
+# Mostrar tabla formateada con colores
+formattable(tabla_estacionariedad, list(
+  ADF_valor_p = formatter("span",
+                    style = ~ style(color = ifelse(ADF_p < 0.05, "green", "red")),
+                    x ~ sprintf("%.4f", x))
+))
+
+
+```
+
+Con un nivel de significación del 0.05, no se rechaza la hipótesis nula. Es decir, existe suficiente evidencia muestral a favor de:
+
+- Las series REAL_VARIACION_IPC_PORCENTAJE, TASA_DESEMPLEO_PORCENTAJE, POILBREUSDM y Food_Price_Index no son estacionarias.
+
+Con un nivel de significación del 0.05, se rechaza la hipótesis nula. Es decir, existe suficiente evidencia muestral a favor de:
+
+- Las series REAL_VARIACION_IPC_PORCENTAJE, TASA_DESEMPLEO_PORCENTAJE, POILBREUSDM y Food_Price_Index son estacionarias.
+
+
+Cumplir con este supuesto es necesario, por lo cual se aplicará una diferencia en aquellas que no cumplan con el supuesto.
+
+```{r}
+
+
+# Identificar variables no estacionarias (p >= 0.05)
+variables_no_estacionarias <- tabla_estacionariedad$Variable[tabla_estacionariedad$ADF_p >= 0.05]
+
+# Copiar los datos log
+datos_VAR_New <- datos_VAR
+
+# Aplicar diferenciación solo a las que no son estacionarias
+datos_VAR_New[, variables_no_estacionarias] <- apply(
+  datos_VAR_New[, variables_no_estacionarias],
+  2,
+  function(x) c(NA, diff(x))
+)
+
+
+
+# Crear un vector con los nuevos nombres
+nombres_actuales <- colnames(datos_VAR_New)
+
+# Modificar solo los nombres de las variables que fueron diferenciadas
+nombres_actualizados <- ifelse(
+  nombres_actuales %in% variables_no_estacionarias,
+  paste0(nombres_actuales, "_DIFF"),
+  nombres_actuales
+)
+
+# Asignar los nuevos nombres al data frame
+colnames(datos_VAR_New) <- nombres_actualizados
+
+```
+
+```{r}
+
+# Función para aplicar solo la prueba ADF
+verificar_estacionariedad_adf <- function(serie) {
+  adf_result <- adf.test(serie)
+  return(adf_result$p.value)
+}
+
+# Aplicar ADF a cada columna de datos_VAR
+resultados_adf <- apply(datos_VAR_New[2:180,], 2, verificar_estacionariedad_adf)
+
+# Convertir a data frame con formato para tabla
+tabla_estacionariedad <- data.frame(
+  Variable = names(resultados_adf),
+  ADF_p = round(resultados_adf, 4),
+  row.names = NULL
+)
+
+# Mostrar tabla formateada con colores
+formattable(tabla_estacionariedad, list(
+  ADF_valor_p = formatter("span",
+                    style = ~ style(color = ifelse(ADF_p < 0.05, "green", "red")),
+                    x ~ sprintf("%.4f", x))
+))
+
+
+datos_VAR_Estacionarias <- datos_VAR_New[2:180,]
+
+```
+Con un nivel de significación del 0.05 se rechaza la hipótesis nula. Es decir, existe suficiente evidencia muestral a favor de que todas las series expuestas cumplen con estacionariedad.
+
+
+
+# Ajuste de modelo VARX
+
+Será necesario transformar los datos nuevamente a un objeto ts() compatible con series de tiempo y modelo VARX. 
+
+```{r}
+datos_ts <- ts(as.data.frame(datos_VAR_Estacionarias), start = c(2010, 2), frequency = 12)
+
+# Separar training y test
+datos_train <- window(datos_ts, end = c(2023, 12))
+datos_test <- window(datos_ts, start = c(2024, 1))
+
+```
+
+
+## Elección del retardo
+
+Para elegir el mejor ajuste, se medirá la raíz del error cuadrático medio (RMSE) al probarla en 2024, donde, cada modelo será entrenado con los datos desde 2010 a 2023 con diferentes retardos.
+
+```{r}
+# 7. Comparar modelos VAR con distintos retardos usando RMSE en predicción
+max_lag <- 12
+h_forecast <- 12
+
+
+rmse_por_lag <- data.frame(
+  Lag = integer(),
+  RMSE = double()
+)
+```
+
+```{r}
+# Variables endógenas
+Y_raw_train <- datos_train[, c("REAL_VARIACION_IPC_PORCENTAJE_DIFF", "TASA_DESEMPLEO_PORCENTAJE_DIFF","TASA_INTERES_PORCENTAJE")]
+
+# Variables exógenas
+X_raw_train <- datos_train[, c("POILBREUSDM_DIFF", "USD_CLP", "Food_Price_Index_DIFF")]
+
+
+# Escalar
+Y_scaled_train <- scale(Y_raw_train)
+X_scaled_train <- scale(X_raw_train)
+
+
+# Matrices
+Y_train <- as.matrix(Y_scaled_train)
+X_train <- as.matrix(X_scaled_train)
+
+
+# Guardar media y sd de USD_CLP para desescalar luego
+usd_mean <- mean(as.numeric(Y_raw_train[,"REAL_VARIACION_IPC_PORCENTAJE_DIFF"]))
+usd_sd   <- sd(as.numeric(Y_raw_train[,"REAL_VARIACION_IPC_PORCENTAJE_DIFF"]))
+
+
+# Variables exógenas
+X_test <- datos_test[, c(
+  "POILBREUSDM_DIFF",
+  "USD_CLP",
+  "Food_Price_Index_DIFF")]
+
+X_futuro<- scale(X_test)
+
+```
+
+```{r, results="hide"}
+
+rmse_por_lag <- c()
+for (lag in 1:max_lag) {
+  ipc_pred<-0
+  ipc_real<-0
+  
+  varx_model <-  MTS::VARX(zt = Y_train, p = lag, xt = X_train)
+
+  pred <- MTS::VARXpred(varx_model, newxt = X_futuro, h = h_forecast)
+  
+  ipc_pred <- pred$pred[, "REAL_VARIACION_IPC_PORCENTAJE_DIFF"] * usd_sd + usd_mean
+  ipc_real <- datos_test[,"REAL_VARIACION_IPC_PORCENTAJE_DIFF"]
+  
+  rmse_val <- rmse(ipc_real, ipc_pred)
+  rmse_por_lag <- rbind(rmse_por_lag, data.frame(Lag = lag, RMSE = rmse_val))
+}
+
+```
+
+
+```{r}
+
+
+
+# Crear el gráfico ggplot con ejes en negro y borde rectangular
+p <- ggplot(rmse_por_lag, aes(x = Lag, y = RMSE)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(
+    title = "Comparación de RMSE por Retardo (Lag)",
+    x = "Número de Retardos (Lag)",
+    y = "RMSE del IPC 2024 (%)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title.x = element_text(face = "bold", size = 12),
+    axis.title.y = element_text(face = "bold", size = 12),
+    axis.line = element_line(color = "black", size = 1),               # Ejes negros
+    panel.border = element_rect(color = "black", fill = NA, size = 1)  # Rectángulo negro
+  )
+
+# Convertir a gráfico interactivo
+ggplotly(p)
+```
+
+Podemos notar que el menor RMSE se presenta en el sexto retardo, con el fin de minimizar los errores de predicción se escogerá este retardo.
+
+## Validación del modelo con el mejor retardo
+
+Comprobaremos la predicción del modelo entrenado con datos de 2010 a 2023, con los datos de variación porcentual del IPC en 2024.
+
+```{r, results="hide"}
+mejor_lag = 6
+h_forecast = 12
+modelo_final <- MTS::VARX(zt = Y_train, p = mejor_lag, xt = X_train)
+
+# Variables exógenas
+X_test <- datos_test[, c(
+  "POILBREUSDM_DIFF",
+  "USD_CLP",
+  "Food_Price_Index_DIFF")]
+
+X_futuro<- scale(X_test)
+
+forecast_final <-  MTS::VARXpred(modelo_final, newxt = X_futuro, h = h_forecast)
+
+# 10. Comparar predicción vs real
+pred_ipc <- forecast_final$pred[, "REAL_VARIACION_IPC_PORCENTAJE_DIFF"] * usd_sd + usd_mean
+real_ipc <- datos_test[,"REAL_VARIACION_IPC_PORCENTAJE_DIFF"]
+
+
+
+#intervalos de confianza 95%.
+
+# Predicciones para la primera variable (IPC)
+yhat <- forecast_final$pred[, 1]
+
+# Desviación estándar del error para la primera variable
+se <- rep(sqrt(modelo_final$Sigma[1, 1]), h_forecast)
+
+# Bandas de confianza del 95%
+upper_ipc <- yhat +  qnorm(0.975) * se
+lower_ipc <- yhat -  qnorm(0.975) * se
+
+
+
+
+
+
+
+df_comp <- data.frame(
+  Fecha = seq(as.Date("2024-01-01"), by = "month", length.out = h_forecast),
+  IPC_Real = real_ipc,
+  IPC_Pronosticado = pred_ipc,
+  IPC_Upper = upper_ipc,
+  IPC_Lower = lower_ipc
+)
+
+```
+
+
+```{r}
+p <- ggplot(df_comp, aes(x = Fecha)) + 
+  # Bandas de confianza (área sombreada) con leyenda
+  geom_ribbon(aes(ymin = IPC_Lower, ymax = IPC_Upper, fill = "IC 95%"), alpha = 0.2) +
+
+  # Línea real
+  geom_line(aes(y = IPC_Real, color = "Real"), size = 0.78, alpha = 0.8) +
+
+  # Línea pronosticada
+  geom_line(aes(y = IPC_Pronosticado, color = "Pronosticado"), size = 0.78, linetype = "dashed", alpha = 0.9) +
+
+  labs(
+    title = "Variación diferenciada IPC Mensual Real vs Pronosticado",
+    y = "Variación IPC (%)",
+    x = "Fecha",
+    color = "Serie",
+    fill = "Intervalo"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "plain", size = 16),
+    legend.position = "bottom",
+    legend.title = element_text(face = "plain"),
+    legend.text = element_text(size = 8),
+    axis.title.y = element_text(face = "plain"),
+    axis.title.x = element_text(face = "plain"),
+    axis.line = element_line(color = "black"),
+    panel.border = element_rect(color = "black", fill = NA, size = 1)
+  ) +
+  scale_color_manual(values = c("Real" = "#1f77b4", "Pronosticado" = "#ff7f0e")) +
+  scale_fill_manual(values = c("IC 95%" = "#ff7f0e"))
+
+# Convertir a gráfico interactivo
+ggplotly(p)
+
+```
+
+
+
+Podemos notar que el modelo a pesar de no ajustarse correctamente a las variaciones porcentuales del IPC en 2024 si percibe variabilidad de las cuales en diversas ocasiones (ej. de enero a febrero) es correcta. Además, encontrándose dentro del intervalo de confianza del 95%.
+
+## Ajuste del modelo final
+
+Ajustamos el modelo final, con los datos completos desde 2010 a 2024. Con el retardo establecido anteriormente (p=6). Es importante mencionar, que en cada definición del modelo VARX se trabajaron con las variables escaladas, por lo que, en cada una de las predicciones expuestas se reescalaron para mostrar las predicciones reales. Para el caso de 2024, se expusieron las predicciones y valores reales (reescaladas), pero sin desdiferenciar, solo para evaluar el comportamiento del modelo. En este caso, para las predicciones de 2025 se expondrán las predicciones y valores de la variación del IPC en Chile originales (desdiferenciado y reescalado).
+
+```{r}
+
+# Crear fechas de enero a mayo de 2025
+fechas <- seq(as.Date("2025-01-01"), as.Date("2025-04-01"), by = "month")
+
+# Crear plantilla vacía
+exogenas_2025 <- data.frame(
+  Fecha = fechas,
+  POILBREUSDM_DIFF = c(4.966186,1.965273,-3.451571,-4.814156),
+  USD_CLP = c(1000.76, 956.62, 932.55, 961.96),
+  Food_Price_Index_DIFF = c(-4.67, 1.76, 0.44, 1.13)
+)
+
+# Mostrar plantilla
+print(exogenas_2025)
+
+
+# Eliminar la columna de fecha para usar solo las variables exógenas
+matriz_exogenas <- as.matrix(exogenas_2025[, -1])
+
+# Convertir a objeto ts: frecuencia = 12 (mensual), inicio = c(2025, 1)
+X_futuro <- ts(matriz_exogenas, start = c(2025, 1), frequency = 12)
+
+X_futuro <- scale(X_futuro)
+
+
+# Variables endógenas
+Y_raw_completo <- datos_ts[, c(1,2,3)]
+
+# Variables exógenas
+X_raw_completo <- datos_ts[, c(4,5,6)]
+
+
+# Escalar
+Y_scaled_completo <- scale(Y_raw_completo)
+X_scaled_completo <- scale(X_raw_completo)
+
+
+# Matrices
+Y_completo <- as.matrix(Y_scaled_completo)
+X_completo <- as.matrix(X_scaled_completo)
+
+
+# Guardar media y sd de USD_CLP para desescalar luego
+usd_mean <- mean(as.numeric(Y_raw_completo[,1]))
+usd_sd   <- sd(as.numeric(Y_raw_completo[,1]))
+```
+
+
+```{r, results="hide"}
+
+mejor_lag = 6
+h_forecast = 4
+modelo_final <- MTS::VARX(zt = Y_completo, p = mejor_lag, xt = X_completo)
+forecast_final <-  MTS::VARXpred(modelo_final, newxt = X_futuro, h = h_forecast)
+
+# 10. Comparar predicción vs real
+pred_ipc <- forecast_final$pred[, "REAL_VARIACION_IPC_PORCENTAJE_DIFF"] * usd_sd + usd_mean
+
+real_ipc <- ts(c(1.1,	0.4,	0.5,	0.2), start = c(2025, 1), frequency = 12)
+ipc_sin_diff <- c()
+ultimo_ipc_sin_diff <- c(as.numeric(Contexto_IPC_2010_2024[180, "REAL_VARIACION_IPC_PORCENTAJE"]))
+
+#DESDIFERENCIAMOS LOS RESULTADOS
+for (i in (1:4)){
+  
+  ipc_sin_diff[i] <- ultimo_ipc_sin_diff + pred_ipc[i] 
+  ultimo_ipc_sin_diff <- ipc_sin_diff[i]
+  print(ultimo_ipc_sin_diff)
+}
+pred_ipc <- ipc_sin_diff
+
+
+
+#intervalos de confianza 95%.
+# Predicciones para la primera variable (IPC) DESDIFERENCIADO
+yhat <- pred_ipc
+
+# Desviación estándar del error para la primera variable DESDIFERENCIADO
+se <- rep(sqrt(modelo_final$Sigma[1, 1] * usd_sd + usd_mean), h_forecast) 
+
+# Bandas de confianza del 95%
+upper_ipc <- yhat +  qnorm(0.975) * se
+lower_ipc <- yhat -  qnorm(0.975) * se
+
+
+
+df_comp <- data.frame(
+  Fecha = seq(as.Date("2025-01-01"), by = "month", length.out = h_forecast),
+  IPC_Real = real_ipc,
+  IPC_Pronosticado = pred_ipc,
+  IPC_Upper = upper_ipc,
+  IPC_Lower = lower_ipc
+)
+
+```
+
+```{r}
+p <- ggplot(df_comp, aes(x = Fecha)) + 
+  # Bandas de confianza (área sombreada) con leyenda
+  geom_ribbon(aes(ymin = IPC_Lower, ymax = IPC_Upper, fill = "IC 95%"), alpha = 0.2) +
+
+  # Línea real
+  geom_line(aes(y = IPC_Real, color = "Real"), size = 0.78, alpha = 0.8) +
+
+  # Línea pronosticada
+  geom_line(aes(y = IPC_Pronosticado, color = "Pronosticado"), size = 0.78, linetype = "dashed", alpha = 0.9) +
+
+  labs(
+    title = "Variación mensual IPC Real vs Pronosticado en 2025",
+    y = "Variación IPC (%)",
+    x = "Mes",
+    color = "Serie",
+    fill = "Intervalo"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "plain", size = 16),
+    legend.position = "bottom",
+    legend.title = element_text(face = "plain"),
+    legend.text = element_text(size = 8),
+    axis.title.y = element_text(face = "plain"),
+    axis.title.x = element_text(face = "plain"),
+    axis.line = element_line(color = "black"),
+    panel.border = element_rect(color = "black", fill = NA, size = 1)
+  ) +
+  scale_color_manual(values = c("Real" = "#1f77b4", "Pronosticado" = "#ff7f0e")) +
+  scale_fill_manual(values = c("IC 95%" = "#ff7f0e"))
+
+# Convertir a gráfico interactivo
+ggplotly(p)
+
+```
+
+Nuevamente, la predicción con respecto a los valores reales de este año 2025 se encuentran dentro del intervalo de confianza. Reduciendo las posibilidades de errores de predicción, estableciendo un margen en el cual pueda encontrarse la real variación del IPC en Chile. Sin embargo, para esos casos en particulares la variación predecida se aleja de la variación real. 
+
+
+# Supuestos modelo final
+
+## No autocorrelación entre los residuos
+
+### ACF y PACF 
+```{r}
+residuos <- residuals(modelo_final)
+
+# Si el modelo es multivariado (VARX), puedes ver la ACF/PACF de una de las series
+Residuos_Modelo_VARX <- residuos[, "REAL_VARIACION_IPC_PORCENTAJE_DIFF"]
+
+par(mfrow = c(1, 2),           # 1 fila, 2 columnas
+    cex.main = 1.6,
+    cex.lab = 1.4,
+    cex.axis = 1.1)
+acf(Residuos_Modelo_VARX, main = "ACF serie VARX(p=6)")
+pacf(Residuos_Modelo_VARX, main = "PACF serie VARX(p=6)")
+```
+
+### Autocorrelación en los residuos de las variables endogenas (Ljung-Box)
+
+$H_0:$ No hay autocorrelación en los residuos hasta el retardo 12 (los residuos son ruido blanco)
+
+v/s
+
+$H_1:$ Hay autocorrelación en los residuos hasta el retardo 12 (los residuos no son ruido blanco)
+
+```{r}
+### 1. AUTOCORRELACIÓN SERIAL EN LOS RESIDUOS (usamos Ljung-Box)
+cat("----- Autocorrelación (Ljung-Box por variable) -----\n")
+apply(residuos, 2, function(x) {
+  pval <- Box.test(x, lag = 12, type = "Ljung-Box")$p.value
+  return(pval)
+})
+
+```
+Con un nivel de significación del 0.05 no se rechaza la hipótesis nula. Es decir, existe suficiente evidencia muestral a favor de que no hay autocorrelación en los residuos hasta el retardo 12 en los modelos de las variables endógenas REAL_VARIACION_IPC_PORCENTAJE_DIFF, TASA_DESEMPLEO_PORCENTAJE_DIFF y TASA_INTERES_PORCENTAJE.
+
+
+## Normalidad en los residuos
+
+$H_0:$ Los residuos provienen desde una distribución normal.
+
+v/s
+
+$H_1:$ Los residuos no provienen desde una distribución normal.
+
+
+```{r}
+
+cat("\n--- Test de normalidad (Lilliefors) por variable ---\n")
+lillie <- apply(residuos, 2, lillie.test)
+print(lillie)
+```
+
+Con un nivel de significación del 0.05 no se rechaza la hipótesis nula. Es decir, existe suficiente evidencia muestral a favor de:
+
+- Los residuos del modelo de REAL_VARIACION_IPC_PORCENTAJE_DIFF y TASA_DESEMPLEO_PORCENTAJE_DIFF provienen desde una distribución normal.
+
+
+Con un nivel de significación del 0.05 se rechaza la hipótesis nula. Es decir, existe suficiente evidencia muestral a favor de:
+
+- Los residuos del modelo de TASA_INTERES_PORCENTAJE no provienen desde una distribución normal.
+
+Por lo cual, en el modelo más importante de la variación del IPC se cumple normalidad en los residuos y también en la tasa de desempleo. Sin embargo, los residuos del modelo de la tasa de interés no cumplen con normalidad. Supuesto que no se cumple, el cual se debe tener en cuenta en las limitaciones del modelo.
+
+
+
+
+
+## Heterocedasticidad 
+
+$H_0:$ No hay efecto ARCH (Los residuos tienen varianza constante)
+
+v/s
+
+$H_1:$ Hay efecto ARCH (La varianza de los residuos dependen de sus valores pasados)
+
+```{r}
+serie_resid <- residuos[, "REAL_VARIACION_IPC_PORCENTAJE_DIFF"]
+# 6. (Opcional) Test de heterocedasticidad para una variable
+cat("\n--- Test ARCH (heterocedasticidad) sobre residuos del IPC ---\n")
+FinTS::ArchTest(serie_resid, lags = 12)
+```
+
+Con un nivel de significación del 0.05 no se rechaza la hipótesis nula. Es decir, existe suficiente evidencia muestral a favor de que los residuos tienen varianza constante y no depende de sus valores pasados.
+
+
+
+# Conclusiones y limitaciones del modelo final
+
+- El modelo VARX definido muestra una buena capacidad respecto a la variabilidad de la variación del IPC en Chile. Sin embargo, las predicciones del modelo en el periodo comprobado de 2024 no logra capturar bien la mayoría de valores de la variación del IPC reales. Pero, aun así, manteniendo dentro del intervalo de confianza del 95% los valores reales de la variación del IPC en Chile.
+
+- Los residuos del modelo cumplen con los principales supuestos estadísticos; no presentan autocorrelación hasta el rezago 12 y son homocedásticos.
+
+- La normalidad en los residuos se cumplen para la variable más relevante: Variación del IPC. Y también, para la tasa de desempleo, lo que asegura la confiabilidad en las inferencias de los intervalos de confianza. 
+
+- La normalidad en los residuos del modelo de la tasa de interés no se cumple, lo que afectará a la precisión de los intervalos de confianza asociadas a ese variable y su predicción.
+
+- Los valores reales se encuentran dentro del intervalo establecido para las predicciones del IPC. Sin embargo, en algunos meses existe una discrepancia entre los valores predichos y los reales. Esto puede sugerir que el modelo puede no capturar todos los factores que influyen en la variación mensual del IPC en Chile.
+
+- El modelo asume relaciones lineales, sin considerar cambios estructurales ni eventos exógenos no anticipados. Esto, limitando la capacidad de adaptación ante escenarios económicos abruptos (ej. guerras, guerras arancelarias, cambios de presidentes, pandemias, entre otros.)
+
+- La calidad de las predicciones depende directamente de la calidad de las proyecciones de las variables exógenas incluidas en el modelo (precio del petroleo, tipo de cambio, etc.)
+
+- Por otro lado, para este caso en concreto, se sugiere que las variables sean originalmente estacionarias y se trabaje sin diferenciación. Debido a que los modelos AR y VARX en diferencias pierden relaciones a largo plazo, siendo unas de las principales ventajas de los modelos AR.
+
+
+# Referencias
+
+- González-Molano, E. R. (2008). Pronósticos de agregados a partir de desagregados caso empírico: Inflación de alimentos en Colombia. Borradores de Economía; No. 504.
+
+- Novales, A. (2017). Modelos vectoriales autoregresivos (VAR). Universidad Complutense de Madrid, 58.
+
+- Peña, D. (2005). Análisis de series temporales. Alianza.
